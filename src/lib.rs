@@ -9,12 +9,10 @@
 extern crate radix_engine;
 extern crate scrypto;
 
-//use radix_engine::engine::validate_data;
+//use radix_engine::errors::TransactionValidationError;
 use radix_engine::ledger::SubstateStore;
-use radix_engine::model::Receipt; //, ValidatedInstruction};
+use radix_engine::model::{Receipt, ValidatedInstruction};
 use radix_engine::transaction::*;
-//use sbor::Decode;
-//use scrypto::{prelude::*, component};
 use scrypto::prelude::*;
 
 /// The user account.
@@ -28,7 +26,7 @@ pub struct User {
 /// Represents a test environment.
 pub struct TestEnv<'l, L: SubstateStore> {
     /// The transaction executioner.
-    pub executor: TransactionExecutor<'l, L>,
+    pub executor: RefCell<TransactionExecutor<'l, L>>,
     /// The users of the test environment.
     pub users: HashMap<String, User>,
     /// The current user of the test environment.
@@ -40,6 +38,9 @@ pub struct TestEnv<'l, L: SubstateStore> {
     /// Storing users private keys of users
     pub users_pk: HashMap<ComponentAddress, EcdsaPrivateKey>,
 }
+
+
+
 
 impl<'l, L: SubstateStore> TestEnv<'l, L> {
     /// Returns a test environment instance with the following fields:
@@ -72,7 +73,7 @@ impl<'l, L: SubstateStore> TestEnv<'l, L> {
         let users_pk: HashMap<ComponentAddress, EcdsaPrivateKey> = HashMap::new();
 
         Self {
-            executor,
+            executor: RefCell::new(executor),
             users,
             current_user: None,
             packages,
@@ -90,7 +91,7 @@ impl<'l, L: SubstateStore> TestEnv<'l, L> {
         let users_pk: HashMap<ComponentAddress, EcdsaPrivateKey> = HashMap::new();
 
         Self {
-            executor,
+            executor: RefCell::new(executor),
             users,
             current_user: None,
             packages,
@@ -122,7 +123,7 @@ impl<'l, L: SubstateStore> TestEnv<'l, L> {
     /// );
     /// ```
     pub fn publish_package(&mut self, name: &str, package: &[u8]) -> &mut Self {
-        let package_addr = self.executor.publish_package(package).unwrap();
+        let package_addr = self.executor.borrow_mut().publish_package(package).unwrap();
         self.packages.insert(String::from(name), package_addr);
 
         //If first package set as default
@@ -213,7 +214,7 @@ impl<'l, L: SubstateStore> TestEnv<'l, L> {
     /// ```
     pub fn create_user(&mut self, name: &str) -> User {
         // public_key, private_key, address
-        let (key, private_key, account) = self.executor.new_account();
+        let (key, private_key, account) = self.executor.borrow_mut().new_account();
         self.users.insert(String::from(name), User { key, account });
 
         let usr = User { key, account };
@@ -354,14 +355,14 @@ impl<'l, L: SubstateStore> TestEnv<'l, L> {
     /// env.create_user("acc1");
     /// let token = env.create_token(10000.into());
     /// ```
-    pub fn create_token(&mut self, max_supply: Decimal) -> ResourceAddress {
+    pub fn create_token(&self, max_supply: Decimal) -> ResourceAddress {
         let (user, private_key) = self.get_current_user();
         let transaction = TransactionBuilder::new()
             .new_token_fixed(HashMap::new(), max_supply.into())
             .call_method_with_all_resources(user.account, "deposit_batch")
-            .build(self.executor.get_nonce([user.key]))
+            .build(self.executor.borrow().get_nonce([user.key]))
             .sign([private_key]);
-        let receipt = self.executor.validate_and_execute(&transaction).unwrap();
+        let receipt = self.executor.borrow_mut().validate_and_execute(&transaction).unwrap();
 
         return receipt.new_resource_addresses[0];
     }
@@ -390,7 +391,7 @@ impl<'l, L: SubstateStore> TestEnv<'l, L> {
     /// assert!(receipt.result.is_ok());
     /// ```
     pub fn call_function(
-        &mut self,
+        &self,
         blueprint_name: &str,
         function_name: &str,
         params: Vec<Vec<u8>>,
@@ -400,9 +401,40 @@ impl<'l, L: SubstateStore> TestEnv<'l, L> {
         let transaction = TransactionBuilder::new()
             .call_function(package, blueprint_name, function_name, params)
             .call_method_with_all_resources(user.account, "deposit_batch")
-            .build(self.executor.get_nonce([user.key]))
+            .build(self.executor.borrow().get_nonce([user.key]))
             .sign([private_key]);
-        let receipt = self.executor.validate_and_execute(&transaction).unwrap();
+        let receipt = self.executor.borrow_mut().validate_and_execute(&transaction).unwrap();
+        receipt
+    }
+
+    pub fn call_function_aux<'a, 'b, 'c: 'a + 'b, 'd: 'b>(
+        &self,
+        blueprint_name: &str,
+        function_name: &str,
+        params: Vec<&'c dyn Param<'a, 'b>>
+    ) -> Receipt {
+        let (user, private_key) = self.get_current_user();
+        let package = self.get_current_package();
+        let mut args = vec![];
+        let mut builder = {
+            let builder = TransactionBuilder::new();
+            let mut rcbuilder = Rc::new(RefCell::new(Some(builder)));
+            let b = rcbuilder.clone();
+            for param in params.into_iter() {
+                {
+                    let encoded = param.encode(b.clone());
+                    drop(param);
+                    args.push(encoded);
+                }
+            }
+            rcbuilder.borrow_mut().replace(None).unwrap()
+        };
+        let transaction = builder
+            .call_function(package, blueprint_name, function_name, args)
+            .call_method_with_all_resources(user.account, "deposit_batch")
+            .build(self.executor.borrow().get_nonce([user.key]))
+            .sign([private_key]);
+        let receipt = self.executor.borrow_mut().validate_and_execute(&transaction).unwrap();
         receipt
     }
 
@@ -449,14 +481,45 @@ impl<'l, L: SubstateStore> TestEnv<'l, L> {
         let transaction = TransactionBuilder::new()
             .call_method(component, method_name, params)
             .call_method_with_all_resources(user.account, "deposit_batch")
-            .build(self.executor.get_nonce([user.key]))
+            .build(self.executor.borrow().get_nonce([user.key]))
             .sign([private_key]);
-        let receipt = self.executor.validate_and_execute(&transaction).unwrap();
+        let receipt = self.executor.borrow_mut().validate_and_execute(&transaction).unwrap();
+        receipt
+    }
+
+    pub fn call_method_aux<'a, 'b, 'c: 'a>(
+        &self,
+        component: ComponentAddress,
+        method_name: &str,
+        params: Vec<&'c dyn Param<'a, 'b>>
+    ) -> Receipt {
+        let (user, private_key) = self.get_current_user();
+        let mut args = vec![];
+        let mut builder = {
+            let builder = TransactionBuilder::new();
+            let mut rcbuilder = Rc::new(RefCell::new(Some(builder)));
+            let b = rcbuilder.clone();
+            //let b = rcbuilder.borrow_mut();
+            for param in params.into_iter() {
+                {
+                    let encoded = param.encode(b.clone());
+                    drop(param);
+                    args.push(encoded);
+                }
+            }
+            rcbuilder.borrow_mut().replace(None).unwrap()
+        };
+        let transaction = builder
+            .call_method(component, method_name, args)
+            .call_method_with_all_resources(user.account, "deposit_batch")
+            .build(self.executor.borrow().get_nonce([user.key]))
+            .sign([private_key]);
+        let receipt = self.executor.borrow_mut().validate_and_execute(&transaction).unwrap();
         receipt
     }
 
     pub fn call_method_auth(
-        &mut self,
+        &self,
         component: ComponentAddress,
         method_name: &str,
         admin_badge: ResourceAddress,
@@ -467,9 +530,9 @@ impl<'l, L: SubstateStore> TestEnv<'l, L> {
             .call_method(user.account, "create_proof", args![admin_badge])
             .call_method(component, method_name, params)
             .call_method_with_all_resources(user.account, "deposit_batch")
-            .build(self.executor.get_nonce([user.key]))
+            .build(self.executor.borrow().get_nonce([user.key]))
             .sign([private_key]);
-        let receipt = self.executor.validate_and_execute(&transaction).unwrap();
+        let receipt = self.executor.borrow_mut().validate_and_execute(&transaction).unwrap();
         receipt
     }
     // TODO: dropped v0.4.1
@@ -533,16 +596,16 @@ impl<'l, L: SubstateStore> TestEnv<'l, L> {
     /// assert!( amount == 1000000.into() );
     /// ```
     pub fn get_amount_for_rd(
-        &mut self,
+        &self,
         component_address: ComponentAddress,
         resource_address: ResourceAddress,
     ) -> Decimal {
         let (user, private_key) = self.get_current_user();
         let transaction_b = TransactionBuilder::new()
             .call_method(component_address, "balance", args![resource_address])
-            .build(self.executor.get_nonce([user.key]))
+            .build(self.executor.borrow().get_nonce([user.key]))
             .sign([private_key]);
-        let receipt_b = self.executor.validate_and_execute(&transaction_b).unwrap();
+        let receipt_b = self.executor.borrow_mut().validate_and_execute(&transaction_b).unwrap();
         let balance: Decimal = scrypto_decode(&receipt_b.outputs[0].raw[..]).unwrap();
         balance
         // TODO: needs some safetyness
@@ -614,7 +677,7 @@ impl<'l, L: SubstateStore> TestEnv<'l, L> {
     /// env.transfer_resource(10.into(), &token, &user2);
     /// ```
     pub fn transfer_resource(
-        &mut self,
+        &self,
         amount: Decimal,
         resource_to_send: &ResourceAddress,
         to_user: &User,
@@ -623,9 +686,9 @@ impl<'l, L: SubstateStore> TestEnv<'l, L> {
         let transaction = TransactionBuilder::new()
             .withdraw_from_account_by_amount(amount, *resource_to_send, user.account)
             .call_method_with_all_resources(to_user.account, "deposit_batch")
-            .build(self.executor.get_nonce([user.key]))
+            .build(self.executor.borrow().get_nonce([user.key]))
             .sign([private_key]);
-        let receipt = self.executor.validate_and_execute(&transaction).unwrap();
+        let receipt = self.executor.borrow_mut().validate_and_execute(&transaction).unwrap();
 
         receipt
     }
@@ -636,101 +699,171 @@ impl<'l, L: SubstateStore> TestEnv<'l, L> {
 //     NonFungibleIds(Vec<NonFungibleId>),
 // }
 
-// TODO: dropped v0.4.1
-// /// Decodes the return value from a blueprint function within a transaction from the receipt
-// /// # Arguments
-// ///
-// /// * `receipt`  - The name of the package as named in the blueprint
-// /// * `blueprint_name` - The name of the blueprint to search for the matching Instruction::CallFunction
-// ///
-// /// NOTE: a custom built transaction may have more than one matching call.  This convenience
-// ///       function may not work in such cases.
-// ///
-// /// # Examples
-// /// ```
-// /// use scrypto_unit::*;
-// /// use radix_engine::ledger::*;
-// /// use scrypto::prelude::*;
-// ///
-// /// let mut ledger = InMemorySubstateStore::with_bootstrap();
-// /// let mut env = TestEnv::new(&mut ledger);
-// ///
-// /// env.publish_package(
-// ///     "package",
-// ///     include_code!("../tests/assets/hello-world", "hello_world")
-// /// );
-// ///
-// /// env.create_user("test user");
-// /// env.acting_as("test user");
-// ///
-// /// const BLUEPRINT: &str = "Hello";
-// /// let mut receipt = env.call_function(BLUEPRINT, "new", vec!["1".to_owned()]);
-// /// assert!(receipt.result.is_ok());
-// /// let ret: Component = return_of_call_function(&mut receipt, BLUEPRINT);
-// /// ```
-// pub fn return_of_call_function<T: Decode>(receipt: &mut Receipt, target_blueprint_name: &str) -> T {
-//     let instruction_index = receipt
-//         .transaction
-//         .instructions
-//         .iter()
-//         .position(|i| match i {
-//             ValidatedInstruction::CallFunction {
-//                 ref blueprint_name, ..
-//             } if blueprint_name == target_blueprint_name => true,
-//             _ => false,
-//         })
-//         .unwrap();
-//     let encoded = receipt.outputs.swap_remove(instruction_index).raw;
-//     scrypto_decode(&encoded).unwrap()
-// }
+/// Decodes the return value from a blueprint function within a transaction from the receipt
+/// # Arguments
+///
+/// * `receipt`  - The name of the package as named in the blueprint
+/// * `blueprint_name` - The name of the blueprint to search for the matching Instruction::CallFunction
+///
+/// NOTE: a custom built transaction may have more than one matching call.  This convenience
+///       function may not work in such cases.
+///
+/// # Examples
+/// ```
+/// use scrypto_unit::*;
+/// use radix_engine::ledger::*;
+/// use scrypto::prelude::*;
+///
+/// let mut ledger = InMemorySubstateStore::with_bootstrap();
+/// let mut env = TestEnv::new(&mut ledger);
+///
+/// env.publish_package(
+///     "package",
+///     include_code!("../tests/assets/hello-world", "hello_world")
+/// );
+///
+/// env.create_user("test user");
+/// env.acting_as("test user");
+///
+/// const BLUEPRINT: &str = "Hello";
+/// let mut receipt = env.call_function(BLUEPRINT, "new", vec!["1".to_owned()]);
+/// assert!(receipt.result.is_ok());
+/// let ret: Component = return_of_call_function(&mut receipt, BLUEPRINT);
+/// ```
+pub fn return_of_call_function<T: Decode>(receipt: &mut Receipt, target_blueprint_name: &str) -> T {
+    let instruction_index = receipt
+        .validated_transaction
+        .instructions
+        .iter()
+        .position(|i| match i {
+            ValidatedInstruction::CallFunction {
+                ref blueprint_name, ..
+            } if blueprint_name == target_blueprint_name => true,
+            _ => false,
+        })
+        .unwrap();
+    let encoded = receipt.outputs.swap_remove(instruction_index).raw;
+    scrypto_decode(&encoded).unwrap()
+}
 
-// TODO: dropped v0.4.1
-// /// Decodes the return value from a component method call within a transaction from the receipt
-// /// # Arguments
-// ///
-// /// * `receipt`  - The name of the package as named in the blueprint
-// /// * `method_name` - The name of the method to search for the matching Instruction::CallMethod
-// ///
-// /// NOTE: a custom built transaction may have more than one matching call.  This convenience
-// ///       function may not work in such cases.
-// ///
-// /// # Examples
-// /// ```
-// /// use scrypto_unit::*;
-// /// use radix_engine::ledger::*;
-// /// use scrypto::prelude::*;
-// ///
-// /// let mut ledger = InMemorySubstateStore::with_bootstrap();
-// /// let mut env = TestEnv::new(&mut ledger);
-// ///
-// /// env.publish_package(
-// ///     "package",
-// ///     include_code!("../tests/assets/hello-world", "hello_world")
-// /// );
-// ///
-// /// env.create_user("test user");
-// /// env.acting_as("test user");
-// ///
-// /// const BLUEPRINT: &str = "Hello";
-// /// let mut receipt = env.call_function(BLUEPRINT, "new", vec!["42".to_owned()]);
-// /// assert!(receipt.result.is_ok());
-// /// let component: Component = return_of_call_function(&mut receipt, BLUEPRINT);
+/// Decodes the return value from a component method call within a transaction from the receipt
+/// # Arguments
+///
+/// * `receipt`  - The name of the package as named in the blueprint
+/// * `method_name` - The name of the method to search for the matching Instruction::CallMethod
+///
+/// NOTE: a custom built transaction may have more than one matching call.  This convenience
+///       function may not work in such cases.
+///
+/// # Examples
+/// ```
+/// use scrypto_unit::*;
+/// use radix_engine::ledger::*;
+/// use scrypto::prelude::*;
+///
+/// let mut ledger = InMemorySubstateStore::with_bootstrap();
+/// let mut env = TestEnv::new(&mut ledger);
+///
+/// env.publish_package(
+///     "package",
+///     include_code!("../tests/assets/hello-world", "hello_world")
+/// );
+///
+/// env.create_user("test user");
+/// env.acting_as("test user");
+///
+/// const BLUEPRINT: &str = "Hello";
+/// let mut receipt = env.call_function(BLUEPRINT, "new", vec!["42".to_owned()]);
+/// assert!(receipt.result.is_ok());
+/// let component: Component = return_of_call_function(&mut receipt, BLUEPRINT);
 
-// /// let mut receipt = env.call_method(&component.address(), "update_state", vec!["77".to_owned()]);
-// /// assert!(receipt.result.is_ok());
-// /// let ret: u32 = return_of_call_method(&mut receipt, "update_state");
-// /// assert!(ret == 42);
-// /// ```
-// pub fn return_of_call_method<T: Decode>(receipt: &mut Receipt, method_name: &str) -> T {
-//     let instruction_index = receipt
-//         .transaction
-//         .instructions
-//         .iter()
-//         .position(|i| match i {
-//             ValidatedInstruction::CallMethod { ref method, .. } if method == method_name => true,
-//             _ => false,
-//         })
-//         .unwrap();
-//     let encoded = receipt.outputs.swap_remove(instruction_index).raw;
-//     scrypto_decode(&encoded).unwrap()
-// }
+/// let mut receipt = env.call_method(&component.address(), "update_state", vec!["77".to_owned()]);
+/// assert!(receipt.result.is_ok());
+/// let ret: u32 = return_of_call_method(&mut receipt, "update_state");
+/// assert!(ret == 42);
+/// ```
+pub fn return_of_call_method<T: Decode>(receipt: &mut Receipt, method_name: &str) -> T {
+    let instruction_index = receipt
+        .validated_transaction
+        .instructions
+        .iter()
+        .position(|i| match i {
+            ValidatedInstruction::CallMethod { ref method, .. } if method == method_name => true,
+            _ => false,
+        })
+        .unwrap();
+    let encoded = receipt.outputs.swap_remove(instruction_index).raw;
+    scrypto_decode(&encoded).unwrap()
+}
+
+// machinery to support the "aux" functions to evaluate parameters using the builder
+use std::rc::Rc;
+use std::borrow::BorrowMut;
+use std::cell::RefCell;
+
+pub trait Param<'a, 'b> {
+    fn encode(&'a self, builder: Rc<RefCell<Option<TransactionBuilder>>>) -> Vec<u8>;
+}
+pub struct CanBuild<E: Encode>(pub Box<dyn (Fn(& mut Rc<RefCell<Option<TransactionBuilder>>>) -> E) >);
+
+pub trait MyEncode {
+    fn myencode(&self) -> Vec<u8>;
+}
+
+impl<E: Encode + Sized> MyEncode for E {
+    fn myencode(&self) -> Vec<u8> {
+        scrypto_encode(self)
+    }
+}
+
+impl<'b: 'c, 'a: 'b, 'c, E: MyEncode> Param<'a, 'b> for E {
+    fn encode(&'a self, mut _builder: Rc<RefCell<Option<TransactionBuilder>>>) -> Vec<u8> {
+        self.myencode()
+    }
+}
+
+impl<'b: 'c, 'a: 'b, 'c, E: Encode> Param<'a, 'b> for CanBuild<E> {
+    fn encode(&'a self, mut builder: Rc<RefCell<Option<TransactionBuilder>>>) -> Vec<u8> {
+        let b = builder.borrow_mut();
+        scrypto_encode(&self.0(b))
+    }
+}
+
+mod macros {
+    #[macro_export]
+    macro_rules! get_param_bucket {
+    ($amount:expr, $resource_address:expr, $account:expr) => {
+        {
+            use std::rc::Rc;
+            use std::borrow::BorrowMut;
+            use std::cell::RefCell;
+
+            let resource_address = $resource_address.clone();
+            let account = $account.clone();
+            let amount = $amount.clone();
+            &CanBuild(Box::new(move |builder: &mut Rc<RefCell<Option<TransactionBuilder>>>| {
+                let mut b: Option<scrypto::resource::Bucket> = None;
+                let mut bui = builder.borrow_mut().replace(None).unwrap();
+                bui
+                    .withdraw_from_account_by_amount(amount, resource_address, account)
+                    .take_from_worktop_by_amount(amount, resource_address, |builder, bucket_id| {
+                        b.replace(scrypto::resource::Bucket(bucket_id));
+                        builder
+                    });
+                builder.borrow_mut().replace(Some(bui));
+                let bb = b.unwrap();
+                bb
+            }))
+        }
+    };
+}
+
+    #[macro_export]
+    macro_rules! get_param_value {
+        ($e:expr) => {
+            (&($e) as &dyn Param)
+        }
+    }
+}
+
+// end machinery
